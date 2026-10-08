@@ -1,92 +1,116 @@
 #include "TCPServer.h"
 
+#include <algorithm>
 #include <iostream>
 
 namespace DataExporter
 {
-
-    TCPServerConnection::TCPServerConnection(asio::io_context &context, asio::ip::tcp::socket socket) : m_ioContextHandle(context), m_socket(std::move(socket))
+    TCPServerConnection::TCPServerConnection(asio::ip::tcp::socket socket)
+        : m_socket(std::move(socket))
     {
     }
 
     TCPServerConnection::~TCPServerConnection()
     {
-        Disconnect();
+        std::error_code ec;
+        m_socket.close(ec);
     }
 
     void TCPServerConnection::Disconnect()
     {
-        if (IsConnected())
-            asio::post(m_ioContextHandle, [this]()
-                       { m_socket.close(); });
+        // Connection objects are owned and manipulated by the io_context thread.
+        std::error_code ec;
+        m_socket.close(ec);
+        m_queue.clear();
+        m_activeHeader.reset();
     }
 
-    /*
-        The job we push to asio is slightly strange. If the queue is empty when we try to push a new job to it, it tells us
-        that the loop of write calls and job submissions had stopped (or was not yet started), so we need to restart/start the
-        cycle of writing data to the socket. Otherwise, we just push the data onto the queue.
-    */
     void TCPServerConnection::Send(const ServerMessage &message)
     {
-        asio::post(m_ioContextHandle,
-                   [this, message]()
-                   {
-                       bool wasEmpty = m_queue.IsEmpty();
-                       m_queue.PushBack(message);
-                       if (wasEmpty)
-                       {
-                           WriteHeader();
-                       }
-                   });
+        if (!m_socket.is_open())
+            return;
+
+        const bool wasEmpty = m_queue.empty();
+        m_queue.push_back(message);
+
+        if (wasEmpty)
+            WriteHeader();
     }
 
     void TCPServerConnection::WriteHeader()
     {
-        uint64_t messageSize = m_queue.Front().size;
-        asio::async_write(m_socket, asio::buffer(&messageSize, sizeof(messageSize)),
-                          [this](std::error_code ec, std::size_t length) // Callback upon completion
+        if (m_queue.empty() || !m_socket.is_open())
+            return;
+
+        // The header must remain alive until async_write completes.
+        m_activeHeader = std::make_shared<uint64_t>(m_queue.front().size);
+        Ref self = shared_from_this();
+
+        asio::async_write(m_socket,
+                          asio::buffer(m_activeHeader.get(), sizeof(*m_activeHeader)),
+                          [self](std::error_code ec, std::size_t /*length*/)
                           {
-                              if (!ec)
+                              if (ec)
                               {
-                                  if (m_queue.Front().size > 0)
-                                      WriteBody(); // submit next job to asio: write body data
-                                  else
-                                  {
-                                      m_queue.PopFront();
-                                      if (!m_queue.IsEmpty())
-                                          WriteHeader(); // submit next job to asio: write the next message
-                                  }
+                                  if (ec != asio::error::operation_aborted)
+                                      std::cerr << "TCPServerConnection -> Failure to write header: "
+                                                << ec.message() << std::endl;
+                                  self->Disconnect();
+                                  return;
                               }
+
+                              self->m_activeHeader.reset();
+
+                              if (self->m_queue.empty())
+                                  return;
+
+                              if (self->m_queue.front().size > 0)
+                                  self->WriteBody();
                               else
                               {
-                                  std::cout << "TCPServerConnection -> Failure to write header of message, with error code: {0}" << ec.message() << std::endl;
-                                  std::cout << "Closing connection..." << std::endl;
-                                  m_socket.close();
+                                  self->m_queue.pop_front();
+                                  if (!self->m_queue.empty())
+                                      self->WriteHeader();
                               }
                           });
     }
 
     void TCPServerConnection::WriteBody()
     {
-        asio::async_write(m_socket, asio::buffer(m_queue.Front().body, m_queue.Front().size),
-                          [this](std::error_code ec, std::size_t length)
+        if (m_queue.empty() || !m_socket.is_open())
+            return;
+
+        Ref self = shared_from_this();
+        ServerMessage &message = m_queue.front();
+
+        // The front message remains in m_queue until this operation completes,
+        // so its vector storage remains valid for the complete async write.
+        asio::async_write(m_socket,
+                          asio::buffer(message.body.data(), message.body.size()),
+                          [self](std::error_code ec, std::size_t /*length*/)
                           {
-                              if (!ec)
+                              if (ec)
                               {
-                                  m_queue.PopFront();
-                                  if (!m_queue.IsEmpty())
-                                      WriteHeader(); // If queue still has data, do it again.
+                                  if (ec != asio::error::operation_aborted)
+                                      std::cerr << "TCPServerConnection -> Failure to write body: "
+                                                << ec.message() << std::endl;
+                                  self->Disconnect();
+                                  return;
                               }
-                              else
-                              {
-                                  std::cout << "TCPServerConnection -> Failure to write body of message, with error code: {0}" << ec.message() << std::endl;
-                                  std::cout << "Closing connection..." << std::endl;
-                                  m_socket.close();
-                              }
+
+                              if (!self->m_queue.empty())
+                                  self->m_queue.pop_front();
+
+                              if (!self->m_queue.empty())
+                                  self->WriteHeader();
                           });
     }
 
-    TCPServer::TCPServer(uint16_t serverPort) : m_acceptor(m_context, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), serverPort)), m_acceptorPort(serverPort)
+    TCPServer::TCPServer(uint16_t serverPort)
+        : m_acceptorPort(serverPort),
+          m_context(),
+          m_acceptor(m_context, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), serverPort)),
+          m_running(false)
     {
     }
 
@@ -97,68 +121,127 @@ namespace DataExporter
 
     void TCPServer::StartServer()
     {
+        if (m_running.exchange(true))
+            return;
+
         try
         {
-            WaitForClient(); // Prime the context with some work, otherwise m_context.run() will simply return!
+            WaitForClient();
             m_ioThread = std::thread([this]()
-                                     { m_context.run(); }); // Post the context to a thread
+                                     {
+                                         try
+                                         {
+                                             m_context.run();
+                                         }
+                                         catch (const std::exception &e)
+                                         {
+                                             std::cerr << "TCP server I/O thread exception: "
+                                                       << e.what() << std::endl;
+                                         }
+                                     });
         }
-        catch (std::exception &e)
+        catch (const std::exception &e)
         {
+            m_running.store(false);
             std::cerr << "Server caught exception: " << e.what() << std::endl;
             return;
         }
 
-        std::cout << "Server has started and is listening for clients on port " << m_acceptorPort << std::endl;
+        std::cout << "Server has started and is listening for clients on port "
+                  << m_acceptorPort << std::endl;
     }
 
     void TCPServer::ShutdownServer()
     {
+        // This gate is checked before MessageClients() posts into the context.
+        // exchange() also makes repeated shutdown calls harmless.
+        if (!m_running.exchange(false))
+            return;
+
+        // Stop accepting immediately. Existing handlers will either complete or
+        // be abandoned when the context is stopped below.
+        std::error_code ec;
+        m_acceptor.close(ec);
+
         m_context.stop();
+
         if (m_ioThread.joinable())
             m_ioThread.join();
+
+        // No io_context handler can touch the client vector after join().
+        m_clients.clear();
 
         std::cout << "Server has been shutdown." << std::endl;
     }
 
-    // We attempt to send a message to all clients. If we find a client who has disconnected for whatever reason,
-    // we remove it from the client list and free up those resources
     void TCPServer::MessageClients(const ServerMessage &message)
     {
-        bool isAnyClientInvalid = false;
+        // This is the only cross-thread boundary. Never touch m_clients or a
+        // connection from the acquisition thread.
+        if (!m_running.load())
+            return;
 
-        for (auto &client : m_clients)
+        asio::post(m_context,
+                   [this, message]()
+                   {
+                       // A message may have been queued immediately before shutdown.
+                       if (!m_running.load())
+                           return;
+
+                       MessageClientsOnIoThread(message);
+                   });
+    }
+
+    void TCPServer::MessageClientsOnIoThread(const ServerMessage &message)
+    {
+        for (std::vector<TCPServerConnection::Ref>::iterator it = m_clients.begin();
+             it != m_clients.end();)
         {
-            if (client->IsConnected())
+            TCPServerConnection::Ref &client = *it;
+
+            if (client && client->IsConnected())
             {
+                // Send() is deliberately synchronous with respect to the
+                // io_context thread: it only queues the message and starts an
+                // asynchronous socket write when necessary.
                 client->Send(message);
+                ++it;
             }
             else
             {
-                client->Disconnect();
-                client.reset();
-                isAnyClientInvalid = true;
+                if (client)
+                    client->Disconnect();
+                it = m_clients.erase(it);
             }
         }
-
-        if (isAnyClientInvalid)
-            m_clients.erase(std::remove(m_clients.begin(), m_clients.end(), nullptr), m_clients.end());
     }
 
-    // Tell the acceptor to look for connections. When a connection is recieved, we add it to the client list.
     void TCPServer::WaitForClient()
     {
+        if (!m_running.load() || !m_acceptor.is_open())
+            return;
+
         m_acceptor.async_accept(
             [this](std::error_code ec, asio::ip::tcp::socket socket)
             {
+                if (!m_running.load())
+                    return;
+
                 if (!ec)
                 {
-                    std::cout << "Server connection to new client: " << socket.remote_endpoint() << std::endl;
-                    m_clients.push_back(std::make_shared<TCPServerConnection>(m_context, std::move(socket)));
+                    std::cout << "Server connection to new client: "
+                              << socket.remote_endpoint() << std::endl;
+                    m_clients.push_back(
+                        std::make_shared<TCPServerConnection>(std::move(socket)));
                 }
-                else
-                    std::cerr << "Server Connection Failure with error code: " << ec.message() << std::endl;
-                WaitForClient();
+                else if (ec != asio::error::operation_aborted)
+                {
+                    std::cerr << "Server Connection Failure with error code: "
+                              << ec.message() << std::endl;
+                }
+
+                if (m_running.load() && m_acceptor.is_open())
+                    WaitForClient();
             });
     }
 }

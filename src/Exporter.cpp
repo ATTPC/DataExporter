@@ -22,20 +22,17 @@ void Exporter::processFrame(mfm::Frame &frame) {
     size_t nbytes = sizeFrame(frame);
     const mfm::Byte *pData = frame.data();
 
-    // Convert frame to raw buffer
-    std::vector<uint8_t> buffer;
-    buffer.insert(buffer.begin(), ((uint8_t *)pData), ((uint8_t *)pData + nbytes));
-    DataExporter::ServerMessage message(buffer);
-
-    // Write the frame to disk
+    // Write the frame to disk first.
     FrameStorage::processFrame(frame);
 
-    // If the server died, for now ignore the frame
-    if (!m_server.IsActive()) {
-        return;
+    // Forward a copy to connected TCP clients.  MessageClients() is the only
+    // cross-thread boundary; all socket/client state is owned by the server's
+    // io_context thread.
+    if (m_server.IsActive()) {
+        std::vector<uint8_t> buffer;
+        buffer.insert(buffer.begin(), ((uint8_t *)pData), ((uint8_t *)pData + nbytes));
+        m_server.MessageClients(DataExporter::ServerMessage(buffer));
     }
-    // Send the frame over the server
-    m_server.MessageClients(message);
 }
 
 /*-----------------------------------------------------------------------------

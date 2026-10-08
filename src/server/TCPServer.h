@@ -1,31 +1,30 @@
 #ifndef TCP_SERVER_H
 #define TCP_SERVER_H
 
-#include "ThreadSafeQueue.h"
 #include "ServerMessage.h"
 
+#include <atomic>
+#include <deque>
 #include <memory>
 #include <thread>
+#include <vector>
 
 #include "asio.hpp"
 
 namespace DataExporter
 {
-
-    // Abstraction representing a connection to our server.
-    // Allows the server to worry only about handling opening/closing connections, rather
-    // than actually transmitting data
-    class TCPServerConnection
+    class TCPServerConnection : public std::enable_shared_from_this<TCPServerConnection>
     {
     public:
         using Ref = std::shared_ptr<TCPServerConnection>;
 
-        TCPServerConnection(asio::io_context &context, asio::ip::tcp::socket socket);
+        explicit TCPServerConnection(asio::ip::tcp::socket socket);
         ~TCPServerConnection();
 
-        bool IsConnected() { return m_socket.is_open(); }
-        void Send(const ServerMessage &message);
+        bool IsConnected() const { return m_socket.is_open(); }
 
+        // These functions are called only from the server io_context thread.
+        void Send(const ServerMessage &message);
         void Disconnect();
 
     private:
@@ -33,37 +32,32 @@ namespace DataExporter
         void WriteBody();
 
         asio::ip::tcp::socket m_socket;
-        asio::io_context &m_ioContextHandle;
-
-        ThreadSafeQueue<ServerMessage> m_queue;
+        std::deque<ServerMessage> m_queue;
+        std::shared_ptr<uint64_t> m_activeHeader;
     };
 
-    // Our actual server. Server basically does two things: listen for connections, and post data to active connections (clients)
-    // We leverage the async powers of asio. This way our program doesn't block and wait when posting data to the clients.
     class TCPServer
     {
     public:
-        TCPServer(uint16_t serverPort);
+        explicit TCPServer(uint16_t serverPort);
         ~TCPServer();
 
         void StartServer();
         void ShutdownServer();
-
         void MessageClients(const ServerMessage &message);
 
-        bool IsActive() const { return m_acceptor.is_open(); }
+        bool IsActive() const { return m_running.load(); }
 
     private:
         void WaitForClient();
+        void MessageClientsOnIoThread(const ServerMessage &message);
 
         uint16_t m_acceptorPort;
-
         asio::io_context m_context;
         asio::ip::tcp::acceptor m_acceptor;
-
         std::vector<TCPServerConnection::Ref> m_clients;
-
         std::thread m_ioThread;
+        std::atomic<bool> m_running;
     };
 }
 
